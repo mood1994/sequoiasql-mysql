@@ -321,6 +321,8 @@ class ha_sdb : public handler {
 
   int update_stats(THD *thd, bool do_read_stat);
 
+  my_bool is_field_type_compatible(Field *old_field, Field *new_field);
+
  private:
   THR_LOCK_DATA lock_data;
   enum thr_lock_type m_lock_type;

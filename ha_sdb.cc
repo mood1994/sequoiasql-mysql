@@ -80,22 +80,26 @@ static PSI_memory_key sdb_key_memory_blobroot;
 
 static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_ADDIDX =
     Alter_inplace_info::ADD_INDEX | Alter_inplace_info::ADD_UNIQUE_INDEX |
-    Alter_inplace_info::ADD_PK_INDEX |
-    Alter_inplace_info::ALTER_COLUMN_NOT_NULLABLE;
+    Alter_inplace_info::ADD_PK_INDEX;
 
 static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_DROPIDX =
     Alter_inplace_info::DROP_INDEX | Alter_inplace_info::DROP_UNIQUE_INDEX |
-    Alter_inplace_info::DROP_PK_INDEX |
-    Alter_inplace_info::ALTER_COLUMN_NULLABLE;
+    Alter_inplace_info::DROP_PK_INDEX;
+
+static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_NOT_SUPPORTED =
+    Alter_inplace_info::RENAME_INDEX | Alter_inplace_info::DROP_COLUMN |
+    Alter_inplace_info::ALTER_COLUMN_NAME;
 
 static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_OPERATIONS =
-    INPLACE_ONLINE_ADDIDX | INPLACE_ONLINE_DROPIDX |
-    Alter_inplace_info::ADD_COLUMN | Alter_inplace_info::DROP_COLUMN |
+    INPLACE_ONLINE_ADDIDX | INPLACE_ONLINE_DROPIDX | INPLACE_NOT_SUPPORTED |
+    Alter_inplace_info::ADD_COLUMN |
     Alter_inplace_info::ALTER_STORED_COLUMN_ORDER |
     Alter_inplace_info::ALTER_STORED_COLUMN_TYPE |
     Alter_inplace_info::ALTER_COLUMN_DEFAULT |
     Alter_inplace_info::ALTER_COLUMN_EQUAL_PACK_LENGTH |
-    Alter_inplace_info::CHANGE_CREATE_OPTION | Alter_inplace_info::RENAME_INDEX;
+    Alter_inplace_info::ALTER_COLUMN_NOT_NULLABLE |
+    Alter_inplace_info::ALTER_COLUMN_NULLABLE |
+    Alter_inplace_info::CHANGE_CREATE_OPTION;
 
 static uchar *sdb_get_key(Sdb_share *share, size_t *length,
                           my_bool not_used MY_ATTRIBUTE((unused))) {
@@ -480,7 +484,6 @@ int ha_sdb::field_to_obj(Field *field, bson::BSONObjBuilder &obj_builder) {
       obj_builder.appendDate(field->field_name, dt);
       break;
     }
-    case MYSQL_TYPE_TIMESTAMP2:
     case MYSQL_TYPE_TIMESTAMP: {
       struct timeval tm;
       int warnings = 0;
@@ -1697,6 +1700,75 @@ error:
   goto done;
 }
 
+my_bool ha_sdb::is_field_type_compatible(Field *old_field, Field *new_field) {
+  if (MYSQL_TYPE_ENUM == old_field->real_type() ||
+      MYSQL_TYPE_ENUM == new_field->real_type() ||
+      MYSQL_TYPE_SET == old_field->real_type() ||
+      MYSQL_TYPE_SET == new_field->real_type()) {
+    return false;
+  }
+
+  switch (old_field->type()) {
+    // numeric type
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+    case MYSQL_TYPE_NEWDECIMAL:
+    case MYSQL_TYPE_DECIMAL: {
+      switch (new_field->type()) {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+        case MYSQL_TYPE_LONGLONG:
+        case MYSQL_TYPE_FLOAT:
+        case MYSQL_TYPE_DOUBLE:
+        case MYSQL_TYPE_NEWDECIMAL:
+        case MYSQL_TYPE_DECIMAL:
+          return true;
+        default:
+          return false;
+      }
+    }
+    // string or binary data type
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_BLOB: {
+      switch (new_field->type()) {
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_STRING:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB:
+        case MYSQL_TYPE_BLOB:
+          return (old_field->binary() == new_field->binary());
+        default:
+          return false;
+      }
+    }
+
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_BIT:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_JSON:
+    case MYSQL_TYPE_NULL:
+    default:
+      return (old_field->type() == new_field->type());
+  }
+}
+
 bool ha_sdb::inplace_alter_table(TABLE *altered_table,
                                  Alter_inplace_info *ha_alter_info) {
   bool rs = true;
@@ -1704,10 +1776,12 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
   THD *thd = current_thd;
   Sdb_conn *conn = NULL;
   Sdb_cl cl;
+  const Alter_inplace_info::HA_ALTER_FLAGS alter_flags =
+      ha_alter_info->handler_flags;
   Bitmap<MAX_INDEXES> ignored_drop_keys;
   Bitmap<MAX_INDEXES> ignored_add_keys;
 
-  DBUG_ASSERT(ha_alter_info->handler_flags | INPLACE_ONLINE_OPERATIONS);
+  DBUG_ASSERT(alter_flags | INPLACE_ONLINE_OPERATIONS);
 
   conn = check_sdb_in_thd(thd, true);
   if (NULL == conn) {
@@ -1722,7 +1796,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     goto error;
   }
 
-  if (ha_alter_info->handler_flags & Alter_inplace_info::CHANGE_CREATE_OPTION) {
+  if (alter_flags & Alter_inplace_info::CHANGE_CREATE_OPTION) {
     char *old_comment = table->s->comment.str;
     char *new_comment = ha_alter_info->create_info->comment.str;
     if (!(old_comment == new_comment ||
@@ -1732,10 +1806,47 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
+  if (alter_flags & Alter_inplace_info::ADD_COLUMN) {
+    // find and check the new field, which can be DEFAULT NULL only.
+    Bitmap<MAX_FIELDS> matched_fields;
+    for (uint16 i = 0; i < altered_table->s->fields; ++i) {
+      Field *field = altered_table->field[i];
+      my_bool is_new_field = true;
+
+      for (uint16 j = 0; j < table->s->fields; ++j) {
+        if (matched_fields.is_set(j)) {
+          continue;
+        }
+        Field *old_field = table->s->field[j];
+        if (0 == strcmp(field->field_name, old_field->field_name)) {
+          is_new_field = false;
+          matched_fields.set_bit(j);
+          break;
+        }
+      }
+
+      if (is_new_field) {
+        my_bool is_default_null = true;;
+        if (field->flags & NOT_NULL_FLAG) {
+          is_default_null = false;
+        } else if (!(field->flags & NO_DEFAULT_VALUE_FLAG)) {
+          my_ptrdiff_t row_offset = field->table->default_values_offset();
+          if (!field->is_real_null(row_offset)) {
+            is_default_null = false;
+          }
+        }
+        if (!is_default_null) {
+          my_error(HA_ERR_WRONG_COMMAND, MYF(0));
+          goto error;
+        }
+      }
+    }
+  }
+
   // If it's a redefinition of the secondary attributes, such as btree/hash and
   // comment, don't recreate the index.
-  if (ha_alter_info->handler_flags & INPLACE_ONLINE_DROPIDX &&
-      ha_alter_info->handler_flags & INPLACE_ONLINE_ADDIDX) {
+  if (alter_flags & INPLACE_ONLINE_DROPIDX &&
+      alter_flags & INPLACE_ONLINE_ADDIDX) {
     for (uint i = 0; i < ha_alter_info->index_drop_count; i++) {
       KEY *drop_key = ha_alter_info->index_drop_buffer[i];
       for (uint j = 0; j < ha_alter_info->index_add_count; j++) {
@@ -1749,7 +1860,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  if (ha_alter_info->handler_flags & INPLACE_ONLINE_DROPIDX) {
+  if (alter_flags & INPLACE_ONLINE_DROPIDX) {
     rc = drop_index(cl, ha_alter_info, ignored_drop_keys);
     if (0 != rc) {
       my_error(ER_GET_ERRNO, MYF(0), rc);
@@ -1757,7 +1868,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  if (ha_alter_info->handler_flags & INPLACE_ONLINE_ADDIDX) {
+  if (alter_flags & INPLACE_ONLINE_ADDIDX) {
     rc = create_index(cl, ha_alter_info, ignored_add_keys);
     if (0 != rc) {
       my_error(ER_GET_ERRNO, MYF(0), rc);
@@ -1765,7 +1876,27 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  if (ha_alter_info->handler_flags & Alter_inplace_info::RENAME_INDEX) {
+  if (alter_flags & Alter_inplace_info::ALTER_STORED_COLUMN_TYPE) {
+    Bitmap<MAX_FIELDS> matched_fields;
+    for (uint16 i = 0; i < altered_table->s->fields; ++i) {
+      Field *new_field = altered_table->s->field[i];
+      for (uint16 j = 0; j < table->s->fields; ++j) {
+        if (matched_fields.is_set(j)) {
+          continue;
+        }
+        Field *old_field = table->s->field[j];
+        if (0 == strcmp(new_field->field_name, old_field->field_name)) {
+          if (!is_field_type_compatible(old_field, new_field)) {
+            my_error(HA_ERR_UNSUPPORTED, MYF(0), cl.get_cl_name());
+            goto error;
+          }
+          matched_fields.set_bit(j);
+        }
+      }
+    }
+  }
+
+  if (alter_flags & INPLACE_NOT_SUPPORTED) {
     my_error(HA_ERR_UNSUPPORTED, MYF(0), cl.get_cl_name());
     goto error;
   }
