@@ -80,11 +80,11 @@ static HASH sdb_open_tables;
 static PSI_memory_key key_memory_sdb_share;
 static PSI_memory_key sdb_key_memory_blobroot;
 
-static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_ADDIDX =
+static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ADDIDX =
     Alter_inplace_info::ADD_INDEX | Alter_inplace_info::ADD_UNIQUE_INDEX |
     Alter_inplace_info::ADD_PK_INDEX;
 
-static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_DROPIDX =
+static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_DROPIDX =
     Alter_inplace_info::DROP_INDEX | Alter_inplace_info::DROP_UNIQUE_INDEX |
     Alter_inplace_info::DROP_PK_INDEX;
 
@@ -92,8 +92,8 @@ static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_NOT_SUPPORTED =
     Alter_inplace_info::RENAME_INDEX | Alter_inplace_info::DROP_COLUMN |
     Alter_inplace_info::ALTER_COLUMN_NAME;
 
-static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_ONLINE_OPERATIONS =
-    INPLACE_ONLINE_ADDIDX | INPLACE_ONLINE_DROPIDX | INPLACE_NOT_SUPPORTED |
+static const Alter_inplace_info::HA_ALTER_FLAGS INPLACE_OPERATIONS =
+    INPLACE_ADDIDX | INPLACE_DROPIDX | INPLACE_NOT_SUPPORTED |
     Alter_inplace_info::ADD_COLUMN |
     Alter_inplace_info::ALTER_STORED_COLUMN_ORDER |
     Alter_inplace_info::ALTER_STORED_COLUMN_TYPE |
@@ -1592,12 +1592,13 @@ int ha_sdb::start_stmt(THD *thd, thr_lock_type lock_type) {
 enum_alter_inplace_result ha_sdb::check_if_supported_inplace_alter(
     TABLE *altered_table, Alter_inplace_info *ha_alter_info) {
   enum_alter_inplace_result rs;
-  KEY *keyInfo;
+  const Alter_inplace_info::HA_ALTER_FLAGS alter_flags =
+      ha_alter_info->handler_flags;
+  KEY *keyInfo = NULL;
 
-  if (ha_alter_info->handler_flags & ~INPLACE_ONLINE_OPERATIONS) {
-    // include offline-operations
-    // rs = handler::check_if_supported_inplace_alter(
-    //                           altered_table, ha_alter_info ) ;
+  if (alter_flags & ~INPLACE_OPERATIONS) {
+    ha_alter_info->unsupported_reason =
+        "SequoiaDB doesn't support the operation";
     rs = HA_ALTER_INPLACE_NOT_SUPPORTED;
     goto done;
   }
@@ -1605,22 +1606,15 @@ enum_alter_inplace_result ha_sdb::check_if_supported_inplace_alter(
   keyInfo = ha_alter_info->key_info_buffer;
   for (; keyInfo < ha_alter_info->key_info_buffer + ha_alter_info->key_count;
        keyInfo++) {
-    KEY_PART_INFO *keyPart;
-    KEY_PART_INFO *keyEnd;
-    /*if ( ( keyInfo->flags & HA_FULLTEXT )
-       || ( keyInfo->flags & HA_PACK_KEY )
-       || ( keyInfo->flags & HA_BINARY_PACK_KEY ))
-    {
-       rs = HA_ALTER_INPLACE_NOT_SUPPORTED ;
-       goto done ;
-    }*/
-    keyPart = keyInfo->key_part;
-    keyEnd = keyPart + keyInfo->user_defined_key_parts;
+    KEY_PART_INFO *keyPart = keyInfo->key_part;
+    KEY_PART_INFO *keyEnd = keyPart + keyInfo->user_defined_key_parts;
     for (; keyPart < keyEnd; keyPart++) {
       keyPart->field = altered_table->field[keyPart->fieldnr];
       keyPart->null_offset = keyPart->field->null_offset();
       keyPart->null_bit = keyPart->field->null_bit;
       if (keyPart->field->flags & AUTO_INCREMENT_FLAG) {
+        ha_alter_info->unsupported_reason =
+            "Cannot support auto-increment field";
         rs = HA_ALTER_INPLACE_NOT_SUPPORTED;
         goto done;
       }
@@ -1634,22 +1628,6 @@ done:
 
 bool ha_sdb::prepare_inplace_alter_table(TABLE *altered_table,
                                          Alter_inplace_info *ha_alter_info) {
-  /*THD *thd = current_thd ;
-  bool rs = false ;
-  switch( thd_sql_command(thd) )
-  {
-  case SQLCOM_CREATE_INDEX:
-  case SQLCOM_DROP_INDEX:
-     rs = false ;
-     break ;
-  default:
-     rs = true ;
-     goto error ;
-  }
-done:
-  return rs ;
-error:
-  goto done ;*/
   return false;
 }
 
@@ -1782,8 +1760,9 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
       ha_alter_info->handler_flags;
   Bitmap<MAX_INDEXES> ignored_drop_keys;
   Bitmap<MAX_INDEXES> ignored_add_keys;
+  Bitmap<MAX_FIELDS> matched_fields;
 
-  DBUG_ASSERT(alter_flags | INPLACE_ONLINE_OPERATIONS);
+  DBUG_ASSERT(alter_flags | INPLACE_OPERATIONS);
 
   conn = check_sdb_in_thd(thd, true);
   if (NULL == conn) {
@@ -1810,7 +1789,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
 
   if (alter_flags & Alter_inplace_info::ADD_COLUMN) {
     // find and check the new field, which can be DEFAULT NULL only.
-    Bitmap<MAX_FIELDS> matched_fields;
+    matched_fields.clear_all();
     for (uint16 i = 0; i < altered_table->s->fields; ++i) {
       Field *field = altered_table->field[i];
       my_bool is_new_field = true;
@@ -1828,7 +1807,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
       }
 
       if (is_new_field) {
-        my_bool is_default_null = true;;
+        my_bool is_default_null = true;
         if (field->flags & NOT_NULL_FLAG) {
           is_default_null = false;
         } else if (!(field->flags & NO_DEFAULT_VALUE_FLAG)) {
@@ -1845,10 +1824,29 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
+  if (alter_flags & Alter_inplace_info::ALTER_STORED_COLUMN_TYPE) {
+    matched_fields.clear_all();
+    for (uint16 i = 0; i < altered_table->s->fields; ++i) {
+      Field *new_field = altered_table->s->field[i];
+      for (uint16 j = 0; j < table->s->fields; ++j) {
+        if (matched_fields.is_set(j)) {
+          continue;
+        }
+        Field *old_field = table->s->field[j];
+        if (0 == strcmp(new_field->field_name, old_field->field_name)) {
+          if (!is_field_type_compatible(old_field, new_field)) {
+            my_error(HA_ERR_WRONG_COMMAND, MYF(0));
+            goto error;
+          }
+          matched_fields.set_bit(j);
+        }
+      }
+    }
+  }
+
   // If it's a redefinition of the secondary attributes, such as btree/hash and
   // comment, don't recreate the index.
-  if (alter_flags & INPLACE_ONLINE_DROPIDX &&
-      alter_flags & INPLACE_ONLINE_ADDIDX) {
+  if (alter_flags & INPLACE_DROPIDX && alter_flags & INPLACE_ADDIDX) {
     for (uint i = 0; i < ha_alter_info->index_drop_count; i++) {
       KEY *drop_key = ha_alter_info->index_drop_buffer[i];
       for (uint j = 0; j < ha_alter_info->index_add_count; j++) {
@@ -1862,7 +1860,7 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  if (alter_flags & INPLACE_ONLINE_DROPIDX) {
+  if (alter_flags & INPLACE_DROPIDX) {
     rc = drop_index(cl, ha_alter_info, ignored_drop_keys);
     if (0 != rc) {
       my_error(ER_GET_ERRNO, MYF(0), rc);
@@ -1870,31 +1868,11 @@ bool ha_sdb::inplace_alter_table(TABLE *altered_table,
     }
   }
 
-  if (alter_flags & INPLACE_ONLINE_ADDIDX) {
+  if (alter_flags & INPLACE_ADDIDX) {
     rc = create_index(cl, ha_alter_info, ignored_add_keys);
     if (0 != rc) {
       my_error(ER_GET_ERRNO, MYF(0), rc);
       goto error;
-    }
-  }
-
-  if (alter_flags & Alter_inplace_info::ALTER_STORED_COLUMN_TYPE) {
-    Bitmap<MAX_FIELDS> matched_fields;
-    for (uint16 i = 0; i < altered_table->s->fields; ++i) {
-      Field *new_field = altered_table->s->field[i];
-      for (uint16 j = 0; j < table->s->fields; ++j) {
-        if (matched_fields.is_set(j)) {
-          continue;
-        }
-        Field *old_field = table->s->field[j];
-        if (0 == strcmp(new_field->field_name, old_field->field_name)) {
-          if (!is_field_type_compatible(old_field, new_field)) {
-            my_error(HA_ERR_UNSUPPORTED, MYF(0), cl.get_cl_name());
-            goto error;
-          }
-          matched_fields.set_bit(j);
-        }
-      }
     }
   }
 
